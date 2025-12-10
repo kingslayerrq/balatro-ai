@@ -1,0 +1,18 @@
+[manifest]
+version = "1.0.0"
+dump_lua = true
+priority = 0
+
+# We hook "before" G:update(dt) runs. 
+# This line is inside love.update and is consistent across versions.
+[[patches]]
+[patches.pattern]
+target = "main.lua"
+pattern = "G:update(dt)"
+position = "before"
+match_indent = true
+payload = '''
+    pcall(function() 
+        if G then require("Mods.BalatroBot.src.bot").update(dt) end
+    end)
+'''
