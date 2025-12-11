@@ -2,13 +2,6 @@
 Balatro RL Training Script
 ==========================
 Training script for the Balatro environment using PPO with action masking.
-
-This script supports:
-- Action masking (only valid actions can be taken)
-- Curriculum learning (gradually increase difficulty)
-- Checkpointing and resuming
-- TensorBoard logging
-- Episode statistics tracking
 """
 
 import os
@@ -37,6 +30,8 @@ from stable_baselines3.common.utils import set_random_seed
 try:
     from sb3_contrib import MaskablePPO
     from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
+    # [FIX] Import the ActionMasker wrapper
+    from sb3_contrib.common.wrappers import ActionMasker
     HAS_SB3_CONTRIB = True
 except ImportError:
     HAS_SB3_CONTRIB = False
@@ -44,6 +39,7 @@ except ImportError:
     print("Install with: pip install sb3-contrib")
 
 from balatro_env import BalatroEnv, BalatroEnvWithMasking
+import configs
 
 
 # =============================================================================
@@ -153,10 +149,13 @@ def make_env(rank: int, seed: int = 0, use_masking: bool = True):
     def _init():
         port = 5000 + rank
         
+        # [FIX] Use the Base Environment (Box Observation), NOT the WithMasking (Dict) one.
+        env = BalatroEnv(port=port)
+        
         if use_masking and HAS_SB3_CONTRIB:
-            env = BalatroEnvWithMasking(port=port)
-        else:
-            env = BalatroEnv(port=port)
+            # [FIX] Wrap with ActionMasker so MaskablePPO can see the valid actions
+            # This calls env.get_action_mask() automatically
+            env = ActionMasker(env, lambda env: env.get_action_mask())
         
         env = Monitor(env)
         env.reset(seed=seed + rank)
@@ -191,30 +190,6 @@ def train(
     device: str = "auto",
     verbose: int = 1,
 ):
-    """
-    Train a PPO agent on Balatro.
-    
-    Args:
-        total_timesteps: Total training timesteps
-        learning_rate: Learning rate
-        n_steps: Steps per rollout
-        batch_size: Minibatch size
-        n_epochs: Epochs per update
-        gamma: Discount factor
-        gae_lambda: GAE lambda
-        clip_range: PPO clip range
-        ent_coef: Entropy coefficient (exploration)
-        vf_coef: Value function coefficient
-        max_grad_norm: Max gradient norm
-        seed: Random seed
-        checkpoint_freq: Save checkpoint every N steps
-        log_dir: TensorBoard log directory
-        model_dir: Model save directory
-        resume_from: Path to model to resume training from
-        use_masking: Use action masking (requires sb3_contrib)
-        device: Device to train on
-        verbose: Verbosity level
-    """
     
     # Create directories
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -229,7 +204,6 @@ def train(
     print(f"Models to: {run_model_dir}")
     
     # Create environment
-    # Note: For multi-env training, you'd need multiple game instances
     env = DummyVecEnv([make_env(0, seed, use_masking)])
     
     # Select algorithm
@@ -256,7 +230,7 @@ def train(
         )
         
         model = algo_class(
-            "MlpPolicy",
+            "MlpPolicy",  # [FIX] Back to MlpPolicy because we removed the Dict wrapper
             env,
             learning_rate=learning_rate,
             n_steps=n_steps,
@@ -325,16 +299,7 @@ def evaluate(
     render: bool = True,
     verbose: int = 1,
 ):
-    """
-    Evaluate a trained model.
-    
-    Args:
-        model_path: Path to trained model
-        n_episodes: Number of episodes to evaluate
-        deterministic: Use deterministic actions
-        render: Render the game state
-        verbose: Verbosity level
-    """
+    """Evaluate a trained model."""
     
     # Create environment
     env = BalatroEnv()
@@ -421,26 +386,16 @@ def evaluate(
 # =============================================================================
 
 def get_hyperparameters(difficulty: str = "default") -> Dict[str, Any]:
-    """
-    Get hyperparameter presets for different training scenarios.
-    
-    Args:
-        difficulty: One of "easy", "default", "hard", "expert"
-    """
-    
     presets = {
-        # Easy: More exploration, slower learning, good for debugging
         "easy": {
             "learning_rate": 1e-4,
             "n_steps": 1024,
             "batch_size": 32,
             "n_epochs": 5,
             "gamma": 0.95,
-            "ent_coef": 0.05,  # More exploration
+            "ent_coef": 0.05,
             "clip_range": 0.3,
         },
-        
-        # Default: Balanced settings
         "default": {
             "learning_rate": 3e-4,
             "n_steps": 2048,
@@ -450,26 +405,22 @@ def get_hyperparameters(difficulty: str = "default") -> Dict[str, Any]:
             "ent_coef": 0.01,
             "clip_range": 0.2,
         },
-        
-        # Hard: For when the agent has learned basics
         "hard": {
             "learning_rate": 1e-4,
             "n_steps": 4096,
             "batch_size": 128,
             "n_epochs": 15,
             "gamma": 0.995,
-            "ent_coef": 0.005,  # Less exploration
+            "ent_coef": 0.005,
             "clip_range": 0.15,
         },
-        
-        # Expert: Fine-tuning a strong agent
         "expert": {
             "learning_rate": 5e-5,
             "n_steps": 8192,
             "batch_size": 256,
             "n_epochs": 20,
             "gamma": 0.999,
-            "ent_coef": 0.001,  # Minimal exploration
+            "ent_coef": 0.001,
             "clip_range": 0.1,
         },
     }
@@ -535,13 +486,21 @@ def main():
     elif args.mode == "test_env":
         print("Testing environment...")
         env = BalatroEnv()
+        if not args.no_masking and HAS_SB3_CONTRIB:
+             env = ActionMasker(env, lambda env: env.get_action_mask())
+             
         print(f"Observation space: {env.observation_space}")
         print(f"Action space: {env.action_space}")
         print("\nWaiting for game connection...")
         obs, info = env.reset()
         print(f"Initial observation shape: {obs.shape}")
-        print(f"Action mask shape: {info['action_mask'].shape}")
-        print(f"Valid actions: {np.sum(info['action_mask'])}")
+        
+        # Check for mask validity
+        mask = env.get_action_mask() if hasattr(env, 'get_action_mask') else info.get('action_mask')
+        if mask is not None:
+             print(f"Action mask shape: {mask.shape}")
+             print(f"Valid actions: {np.sum(mask)}")
+        
         env.render()
         env.close()
 

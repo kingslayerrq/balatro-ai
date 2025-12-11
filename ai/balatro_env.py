@@ -33,7 +33,8 @@ class GamePhase(IntEnum):
     BLIND_SELECT = 1
     SHOP = 2
     PACK_OPENING = 3
-    GAME_OVER = 4
+    BLIND_COMPLETE = 4  # Screen after beating/failing a blind (cash out button)
+    GAME_OVER = 5
 
 
 class BlindAction(IntEnum):
@@ -211,14 +212,18 @@ class ActionConfig:
         65-72: Select card 0-7 from pack
         73: Skip remaining
         74: (reserved)
+
+    BLIND COMPLETE PHASE (75-76):
+        75: Cash out / Continue to shop
+        76: (reserved)
     """
-    
+
     # Blind phase actions
     TOGGLE_START = 0
     TOGGLE_END = 11
     PLAY_HAND = 12
     DISCARD_HAND = 13
-    
+
     # Shop phase actions
     SHOP_START = 39
     BUY_SLOT_START = 39
@@ -229,21 +234,24 @@ class ActionConfig:
     USE_CONSUMABLE_END = 50
     REROLL_SHOP = 51
     NEXT_ROUND = 52
-    
+
     # Blind select actions
     BLIND_SELECT_START = 59
     SELECT_SMALL = 59
     SELECT_BIG = 60
     SELECT_BOSS = 61
     SKIP_BLIND = 62
-    
+
     # Pack opening actions
     PACK_START = 65
     PACK_CARD_START = 65
     PACK_CARD_END = 72
     PACK_SKIP = 73
-    
-    TOTAL_ACTIONS = 75
+
+    # Blind complete actions
+    CASH_OUT = 75
+
+    TOTAL_ACTIONS = 77
     
     @classmethod
     def get_action_type(cls, action: int) -> Tuple[str, int]:
@@ -276,6 +284,8 @@ class ActionConfig:
             return ("pack_select", action - cls.PACK_CARD_START)
         elif action == cls.PACK_SKIP:
             return ("pack_skip", 0)
+        elif action == cls.CASH_OUT:
+            return ("cash_out", 0)
         else:
             return ("unknown", action)
 
@@ -468,6 +478,8 @@ class BalatroEnv(gym.Env):
             mask = self._get_blind_select_action_mask(state, mask)
         elif phase == GamePhase.PACK_OPENING:
             mask = self._get_pack_action_mask(state, mask)
+        elif phase == GamePhase.BLIND_COMPLETE:
+            mask = self._get_blind_complete_action_mask(state, mask)
         else:
             # Game over - no valid actions
             pass
@@ -481,6 +493,8 @@ class BalatroEnv(gym.Env):
                 mask[ActionConfig.NEXT_ROUND] = True
             elif phase == GamePhase.BLIND_SELECT:
                 mask[ActionConfig.SELECT_SMALL] = True
+            elif phase == GamePhase.BLIND_COMPLETE:
+                mask[ActionConfig.CASH_OUT] = True
         
         return mask
     
@@ -570,9 +584,15 @@ class BalatroEnv(gym.Env):
         
         # Can always skip
         mask[ActionConfig.PACK_SKIP] = True
-        
+
         return mask
-    
+
+    def _get_blind_complete_action_mask(self, state: Dict, mask: np.ndarray) -> np.ndarray:
+        """Mask for blind complete phase (cash out screen)."""
+        # Only action is to cash out and continue
+        mask[ActionConfig.CASH_OUT] = True
+        return mask
+
     # =========================================================================
     # OBSERVATION BUILDING
     # =========================================================================
@@ -926,7 +946,11 @@ class BalatroEnv(gym.Env):
             reward += self._reward_blind_select_phase(old_state, action_type, new_state)
         elif phase == GamePhase.PACK_OPENING:
             reward += self._reward_pack_phase(old_state, action_type, action_index, new_state)
-        
+        elif phase == GamePhase.BLIND_COMPLETE:
+            # Simple transition phase - small positive for progressing
+            if action_type == "cash_out":
+                reward += 1.0
+
         return reward
     
     def _reward_blind_phase(self, old_state: Dict, action_type: str, 
@@ -1119,6 +1143,8 @@ class BalatroEnv(gym.Env):
             return {"type": "pack_select", "index": action_index}
         elif action_type == "pack_skip":
             return {"type": "pack_skip"}
+        elif action_type == "cash_out":
+            return {"type": "cash_out"}
         else:
             logging.warning(f"Unknown action type: {action_type}")
             return {"type": "ping"}
@@ -1139,6 +1165,8 @@ class BalatroEnv(gym.Env):
             return GamePhase.BLIND_SELECT
         elif phase_str == "pack" or phase_str == "pack_opening":
             return GamePhase.PACK_OPENING
+        elif phase_str == "blind_complete":
+            return GamePhase.BLIND_COMPLETE
         else:
             return GamePhase.BLIND
     
