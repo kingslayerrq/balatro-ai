@@ -20,6 +20,7 @@ import numpy as np
 from gymnasium import spaces
 from enum import IntEnum
 from typing import Dict, List, Tuple, Optional, Any
+from replay_recorder import ReplayRecorder
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -84,7 +85,7 @@ JOKER_TYPES = [
     "Fortune Teller", "Juggler", "Drunkard", "Stone Joker", "Golden Joker",
     "Lucky Cat", "Baseball Card", "Bull", "Diet Cola", "Trading Card",
     "Flash Card", "Popcorn", "Spare Trousers", "Ancient Joker", "Ramen",
-    "Walkie Talkie", "Seltzer", "Castle", "Smiley Face", "Campfire",
+    "Walkie Talkie", "Seltzer", "Castle", "Smiley Face", "Campfire", "Throwback",
     # Legendary jokers
     "Canio", "Triboulet", "Yorick", "Chicot", "Perkeo",
     # Add more as needed...
@@ -303,37 +304,40 @@ class BalatroEnv(gym.Env):
     
     metadata = {"render_modes": ["human", "ansi"]}
     
-    def __init__(self, host: str = "127.0.0.1", port: int = 5000):
+    def __init__(self, host: str = "127.0.0.1", port: int = 5000, model_name: str = "default"):
         super().__init__()
-        
+
         # Network config
         self.host = host
         self.port = port
-        
+
         # Action space: flat discrete with masking
         self.action_space = spaces.Discrete(ActionConfig.TOTAL_ACTIONS)
-        
+
         # Observation space
         obs_size = ObsConfig.total_size()
         self.observation_space = spaces.Box(
             low=0.0, high=1.0, shape=(obs_size,), dtype=np.float32
         )
-        
+
         # State tracking
         self.last_state: Dict[str, Any] = {}
         self.prev_chips: int = 0
         self.prev_money: int = 0
         self.current_phase: GamePhase = GamePhase.BLIND
         self.episode_stats: Dict[str, Any] = {}
-        
+
         # Networking
         self.server: Optional[socket.socket] = None
         self.conn: Optional[socket.socket] = None
         self.buffer: bytes = b""
-        
+
+        # Replay recording
+        self.replay_recorder = ReplayRecorder(model_name=model_name)
+
         # Initialize server
         self._setup_server()
-        
+
         logging.info(f"BalatroEnv v2 initialized. Observation size: {obs_size}")
     
     def _setup_server(self):
@@ -383,10 +387,14 @@ class BalatroEnv(gym.Env):
                 self.prev_chips = state.get("chips", 0)
                 self.prev_money = state.get("money", 0)
                 self.current_phase = self._detect_phase(state)
-                
+
+                # Start replay recording
+                self.replay_recorder.start_recording(state)
+
                 logging.info(f"RESET: Success. Phase={self.current_phase.name}, "
-                           f"Money=${state.get('money', 0)}, Ante={state.get('ante', 1)}")
-                
+                           f"Money=${state.get('money', 0)}, Ante={state.get('ante', 1)}, "
+                           f"Seed={state.get('seed', 'unknown')}")
+
                 obs = self._build_observation(state)
                 info = {"action_mask": self.get_action_mask()}
                 return obs, info
@@ -425,38 +433,88 @@ class BalatroEnv(gym.Env):
         
         # Receive new state
         new_state = self._read_packet(block_forever=True)
+        # If we selected a blind, wait until we leave 'blind_select' phase
+        if action_type in ["select_blind", "skip_blind", "next_round"]:
+            retries = 20 # Wait up to 2 seconds
+            current_phase = self.last_state.get("phase")
+            
+            while new_state and new_state.get("phase") == current_phase and retries > 0:
+                logging.info(f"Step: Waiting for phase change (Action: {action_type})...")
+                time.sleep(0.1)
+                self._send_command({"type": "ping"})
+                new_state = self._read_packet(block_forever=True)
+                retries -= 1
+        
+        # Wait for game to load
+        while new_state and new_state.get("phase") == "blind" and new_state.get("blind_target", 0) <= 0:
+             logging.info("Step: Game loading (target=0)... waiting...")
+             time.sleep(0.1)
+             self._send_command({"type": "ping"})
+             new_state = self._read_packet(block_forever=True)
+        # print(f"Blind target: {new_state.get('blind_target', 0)}")
         if not new_state:
             return self._crash_exit()
         
         # Calculate reward
         reward = self._calculate_reward(self.last_state, action_type, action_index, new_state)
-        
+
         # Check for state change (penalize no-ops)
         if self._states_equal(self.last_state, new_state):
             reward -= 1.0  # Small penalty for wasted action
-        
+
+        # Record action in replay
+        self.replay_recorder.record_action(
+            action_type=action_type,
+            action_index=action_index,
+            state_before=self.last_state,
+            state_after=new_state,
+            reward=reward
+        )
+
         # Update tracking
         old_phase = self.current_phase
         self.current_phase = self._detect_phase(new_state)
+
+        # Track blinds won before update
+        old_blinds_won = self.episode_stats.get("blinds_won", 0)
+
         self._update_episode_stats(action_type, self.last_state, new_state)
-        
+
+        # Update replay stats
+        self.replay_recorder.update_stats(self.episode_stats)
+
+        # Check if we just won a blind
+        new_blinds_won = self.episode_stats.get("blinds_won", 0)
+        if new_blinds_won > old_blinds_won:
+            # Just won a blind! Save replay immediately
+            logging.info(f"Blind won! Saving replay (Total blinds: {new_blinds_won})")
+            self.replay_recorder.finish_recording(success=True, final_stats=self.episode_stats)
+            # Restart recording for next blind
+            self.replay_recorder.start_recording(new_state)
+
         self.last_state = new_state
         self.prev_chips = new_state.get("chips", 0)
         self.prev_money = new_state.get("money", 0)
-        
+
         # Check termination
         done = new_state.get("game_over", False) or new_state.get("game_won", False)
-        
+
+        # Finish replay recording if episode done (for final blind or game over)
+        if done:
+            blinds_won = self.episode_stats.get("blinds_won", 0)
+            success = blinds_won > 0  # Only save if we won at least one blind
+            self.replay_recorder.finish_recording(success=success, final_stats=self.episode_stats)
+
         # Build observation
         obs = self._build_observation(new_state)
-        
+
         info = {
             "action_mask": self.get_action_mask(),
             "phase": self.current_phase.name,
             "phase_changed": old_phase != self.current_phase,
             "episode_stats": self.episode_stats.copy(),
         }
-        
+
         return obs, reward, done, False, info
     
     def get_action_mask(self) -> np.ndarray:
@@ -527,30 +585,30 @@ class BalatroEnv(gym.Env):
         shop_items = state.get("shop", [])
         jokers = state.get("jokers", [])
         consumables = state.get("consumables", [])
-        
+
         # Buy items (if affordable and slot exists)
         for i, item in enumerate(shop_items[:5]):
             if item and item.get("cost", 999) <= money:
                 mask[ActionConfig.BUY_SLOT_START + i] = True
-        
+
         # Sell jokers (if jokers exist)
         for i, joker in enumerate(jokers[:5]):
             if joker:
                 mask[ActionConfig.SELL_JOKER_START + i] = True
-        
-        # Use consumables (if they exist and are usable)
+
+        # Use consumables (planet/tarot/spectral cards can be used in shop)
         for i, cons in enumerate(consumables[:2]):
             if cons and cons.get("usable", True):
                 mask[ActionConfig.USE_CONSUMABLE_START + i] = True
-        
+
         # Reroll (costs $5 by default, but can vary)
         reroll_cost = state.get("reroll_cost", 5)
         if money >= reroll_cost:
             mask[ActionConfig.REROLL_SHOP] = True
-        
+
         # Next round is always valid in shop
         mask[ActionConfig.NEXT_ROUND] = True
-        
+
         return mask
     
     def _get_blind_select_action_mask(self, state: Dict, mask: np.ndarray) -> np.ndarray:
@@ -576,13 +634,26 @@ class BalatroEnv(gym.Env):
         """Mask for pack opening phase."""
         pack_cards = state.get("pack_cards", [])
         picks_remaining = state.get("pack_picks_remaining", 0)
-        
-        if picks_remaining > 0:
-            for i, card in enumerate(pack_cards[:8]):
-                if card and not card.get("picked", False):
-                    mask[ActionConfig.PACK_CARD_START + i] = True
-        
-        # Can always skip
+
+        # If pack_cards is empty, pack hasn't initialized yet OR we've selected all cards
+        # Enable pack_skip as a "wait" action
+        if not pack_cards:
+            mask[ActionConfig.PACK_SKIP] = True
+            return mask
+
+        # If no picks remaining, we can only skip (or wait for auto-close)
+        if picks_remaining == 0:
+            # All picks used up - can ONLY skip now
+            mask[ActionConfig.PACK_SKIP] = True
+            return mask
+
+        # If picks remaining > 0, we can select cards
+        # Enable card selection
+        for i, card in enumerate(pack_cards[:8]):
+            if card and not card.get("picked", False):
+                mask[ActionConfig.PACK_CARD_START + i] = True
+
+        # Always enable skip (for regular packs, or to wait for mega packs)
         mask[ActionConfig.PACK_SKIP] = True
 
         return mask
@@ -763,11 +834,19 @@ class BalatroEnv(gym.Env):
     def _encode_hand_levels(self, obs: np.ndarray, cursor: int, state: Dict) -> int:
         """Encode the level of each poker hand type."""
         hand_levels = state.get("hand_levels", {})
-        
+
         for i, hand_type in enumerate(HAND_TYPES):
-            level = hand_levels.get(hand_type, 1)
+            hand_data = hand_levels.get(hand_type, {})
+
+            # Handle both old format (int) and new format (dict with level/chips/mult)
+            if isinstance(hand_data, dict):
+                level = hand_data.get("level", 1)
+            else:
+                # Backward compatibility: if it's just a number
+                level = hand_data if hand_data else 1
+
             obs[cursor + i] = min(level / 10.0, 1.0)  # Normalize to ~level 10
-        
+
         return cursor + ObsConfig.HAND_LEVELS_SIZE
     
     def _encode_jokers(self, obs: np.ndarray, cursor: int, state: Dict) -> int:
@@ -953,7 +1032,83 @@ class BalatroEnv(gym.Env):
 
         return reward
     
-    def _reward_blind_phase(self, old_state: Dict, action_type: str, 
+    def _assess_hand_quality(self, old_state: Dict, progress_delta: float,
+                            discards_left: int) -> float:
+        """
+        Generalized hand quality assessment for ALL hand types.
+
+        Core principle: ALWAYS use the highest value cards available.
+        - Pair of Aces > Pair of 5s
+        - Straight with face cards > Straight with low cards
+        - Flush with K-high > Flush with 9-high
+
+        Returns reward/penalty based on card optimization.
+        """
+        reward = 0.0
+
+        hand_cards = old_state.get("hand", [])
+        if not hand_cards:
+            return 0.0
+
+        selected_cards = [c for c in hand_cards if c.get("selected", False)]
+        unselected_cards = [c for c in hand_cards if not c.get("selected", False)]
+
+        if not selected_cards:
+            return 0.0
+
+        # Card value (Ace=14, King=13, ..., 2=2)
+        def get_card_value(card):
+            rank = card.get("rank", "2")
+            values = {"A": 14, "K": 13, "Q": 12, "J": 11, "10": 10,
+                     "9": 9, "8": 8, "7": 7, "6": 6, "5": 5, "4": 4, "3": 3, "2": 2}
+            return values.get(rank, 2)
+
+        selected_values = [get_card_value(c) for c in selected_cards]
+        avg_selected = sum(selected_values) / len(selected_values)
+        max_selected = max(selected_values)
+
+        # ========== UNIVERSAL: Use high cards for ANY hand type ==========
+        if unselected_cards:
+            unselected_values = [get_card_value(c) for c in unselected_cards]
+            max_unselected = max(unselected_values)
+            avg_unselected = sum(unselected_values) / len(unselected_values)
+
+            # MAJOR PENALTY: Much better cards left unplayed
+            if max_unselected > max_selected + 3:
+                reward -= 4.0  # e.g., played 8s but have Kings
+                if progress_delta < 0.05:
+                    reward -= 2.0  # Minimal progress with bad cards
+
+            # PENALTY: Average unplayed cards better than played
+            elif avg_unselected > avg_selected + 2:
+                reward -= 2.5  # Suboptimal card selection
+
+            # PENALTY: Low cards with discards available
+            if avg_selected < 6 and discards_left > 0 and progress_delta < 0.08:
+                reward -= 2.0  # Should discard and redraw
+
+        # ========== HEURISTIC: Reward strong hand patterns ==========
+        num_selected = len(selected_cards)
+
+        # 5-card plays (likely straight/flush) with high cards = good
+        if num_selected == 5 and avg_selected >= 9:
+            reward += 1.5  # Encourage big hands with good cards
+
+        # Single card plays (high card) assessment
+        if num_selected == 1:
+            if max_selected >= 12:  # Q/K/A
+                reward += 0.5  # Good single card choice
+            elif max_selected <= 6 and discards_left > 0:
+                reward -= 3.0  # Terrible - low single card with discards
+
+        # ========== EFFICIENCY ==========
+        # Very weak plays that barely score
+        if progress_delta < 0.02 and discards_left > 0:
+            reward -= 3.0  # Should have discarded
+
+        return reward
+
+    def _reward_blind_phase(self, old_state: Dict, action_type: str,
                            action_index: int, new_state: Dict) -> float:
         """Rewards for blind (playing) phase."""
         reward = 0.0
@@ -995,11 +1150,15 @@ class BalatroEnv(gym.Env):
         if action_type == "play" and old_hands > new_hands:
             # Played a hand
             self.episode_stats["hands_played"] += 1
-            
+
+            # Assess hand quality - did they play good cards?
+            hand_quality_penalty = self._assess_hand_quality(old_state, progress_delta, new_discards)
+            reward += hand_quality_penalty
+
             # Penalty for weak plays when discards available
             if progress_delta < 0.1 and new_discards > 0:
                 reward -= 2.0  # Should have discarded first
-            
+
             # Penalty for no progress (invalid/blocked hand)
             if progress_delta == 0:
                 reward -= 5.0
@@ -1069,7 +1228,30 @@ class BalatroEnv(gym.Env):
         
         # ========== USED CONSUMABLE ==========
         if action_type == "use_consumable":
-            reward += 1.0  # Generally good to use consumables
+            # Check if the consumable was actually consumed
+            old_consumables_list = old_state.get("consumables", [])
+            new_consumables_list = new_state.get("consumables", [])
+            old_consumables = len(old_consumables_list)
+            new_consumables = len(new_consumables_list)
+
+            if new_consumables < old_consumables:
+                # Successfully used - consumable count decreased
+                # Check if it was a Planet card (very valuable for leveling hands)
+                # action_index is the index of the consumable used
+                used_consumable = old_consumables_list[action_index] if action_index < len(old_consumables_list) else None
+                card_type = used_consumable.get("type", "") if used_consumable else ""
+
+                if "Planet" in card_type:
+                    # GENEROUS reward for using planet cards - they level up hands
+                    reward += 15.0
+                    logging.info("Used Planet card - generous reward!")
+                else:
+                    # Regular consumable (Tarot, Spectral)
+                    reward += 3.0
+            else:
+                # FAILED - consumable still there
+                # Give small penalty but not harsh (no major downside)
+                reward -= 2.0
         
         # ========== REROLL ==========
         if action_type == "reroll":
@@ -1092,8 +1274,11 @@ class BalatroEnv(gym.Env):
             reward += 1.0
         elif action_type == "skip_blind":
             # Skipped - can be strategic, neutral reward
-            # Could add logic to reward skipping bad boss blinds
-            reward += 0.5
+            # Only reward skip if we have Throwback
+            if "Throwback" in new_state.get("Jokers", []):
+                reward += 0.5
+            else:
+                reward -= 5.0  # Penalty for skipping without strategic reason
         
         return reward
     
@@ -1101,14 +1286,62 @@ class BalatroEnv(gym.Env):
                           action_index: int, new_state: Dict) -> float:
         """Rewards for pack opening phase."""
         reward = 0.0
-        
+
+        old_picks = old_state.get("pack_picks_remaining", 0)
+        new_picks = new_state.get("pack_picks_remaining", 0)
+        old_pack_cards = len(old_state.get("pack_cards", []))
+        new_pack_cards = len(new_state.get("pack_cards", []))
+
         if action_type == "pack_select":
-            # Selected a card from pack
-            reward += 1.0
+            # Check if we actually selected a card (picks decreased or cards decreased)
+            if new_picks < old_picks or new_pack_cards < old_pack_cards:
+                # Successfully selected a card!
+                reward += 5.0
+                logging.info(f"Successfully selected pack card! Picks: {old_picks} -> {new_picks}")
+
+            else:
+                # Selection FAILED - this is a CRITICAL mistake
+                # Common reasons:
+                # 1. Tried to select when picks_remaining = 0 (already selected max)
+                # 2. Invalid card index
+                # 3. Card no longer available
+
+                if old_picks == 0:
+                    # HUGE penalty - tried to select when no picks remaining
+                    reward -= 20.0
+                    logging.warning("CRITICAL: Tried to select card with 0 picks remaining!")
+                else:
+                    # Other selection failure
+                    reward -= 10.0
+                    logging.warning("Pack card selection failed - invalid action")
+
         elif action_type == "pack_skip":
-            # Skipped - sometimes correct
-            reward += 0.2
-        
+            # Check if we left pack phase (skip succeeded)
+            new_phase = new_state.get("phase", "unknown")
+            old_pack_cards = old_state.get("pack_cards", [])
+            new_picks = new_state.get("pack_picks_remaining", 0)
+
+            if new_phase != "pack_opening":
+                # Successfully skipped pack
+                # Small reward - skipping is valid but wastes potential value
+                reward += 0.5
+            else:
+                # Skip failed - still in pack phase
+                # Check WHY it failed:
+
+                if not old_pack_cards:
+                    # Pack hasn't loaded yet - bot is just waiting
+                    # Small penalty for inefficiency, but not harsh
+                    reward -= 0.5
+                elif new_picks > 0:
+                    # Mega pack with picks remaining - MUST select cards
+                    # This is a mistake - penalize
+                    reward -= 5.0
+                    logging.warning("Pack skip failed - mega pack requires card selections")
+                else:
+                    # Other skip failure
+                    reward -= 2.0
+
         return reward
     
     # =========================================================================

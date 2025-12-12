@@ -137,30 +137,31 @@ class ActionMaskingCallback(BaseCallback):
 # ENVIRONMENT FACTORY
 # =============================================================================
 
-def make_env(rank: int, seed: int = 0, use_masking: bool = True):
+def make_env(rank: int, seed: int = 0, use_masking: bool = True, model_name: str = "default"):
     """
     Create a Balatro environment instance.
-    
+
     Args:
         rank: Index of this environment (for port assignment)
         seed: Random seed
         use_masking: Whether to use the masking wrapper
+        model_name: Name of the model (for replay recording)
     """
     def _init():
         port = 5000 + rank
-        
+
         # [FIX] Use the Base Environment (Box Observation), NOT the WithMasking (Dict) one.
-        env = BalatroEnv(port=port)
-        
+        env = BalatroEnv(port=port, model_name=model_name)
+
         if use_masking and HAS_SB3_CONTRIB:
             # [FIX] Wrap with ActionMasker so MaskablePPO can see the valid actions
             # This calls env.get_action_mask() automatically
             env = ActionMasker(env, lambda env: env.get_action_mask())
-        
+
         env = Monitor(env)
         env.reset(seed=seed + rank)
         return env
-    
+
     set_random_seed(seed)
     return _init
 
@@ -196,15 +197,15 @@ def train(
     run_name = f"balatro_ppo_{timestamp}"
     run_log_dir = os.path.join(log_dir, run_name)
     run_model_dir = os.path.join(model_dir, run_name)
-    
+
     os.makedirs(run_log_dir, exist_ok=True)
     os.makedirs(run_model_dir, exist_ok=True)
-    
+
     print(f"Logging to: {run_log_dir}")
     print(f"Models to: {run_model_dir}")
-    
-    # Create environment
-    env = DummyVecEnv([make_env(0, seed, use_masking)])
+
+    # Create environment with model name for replay recording
+    env = DummyVecEnv([make_env(0, seed, use_masking, model_name=run_name)])
     
     # Select algorithm
     if use_masking and HAS_SB3_CONTRIB:

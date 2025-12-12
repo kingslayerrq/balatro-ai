@@ -15,3 +15,5 @@ Thumbs.db
 # VS Code / IDE
 .vscode/
 .idea/
+
+models/
