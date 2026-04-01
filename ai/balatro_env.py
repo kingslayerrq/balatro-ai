@@ -451,6 +451,18 @@ class BalatroEnv(gym.Env):
              time.sleep(0.1)
              self._send_command({"type": "ping"})
              new_state = self._read_packet(block_forever=True)
+
+        # If we are in pack_opening but have 0 cards, the animation is still playing.
+        while new_state and new_state.get("phase") == "pack_opening":
+            pack_cards = new_state.get("pack_cards", [])
+            if not pack_cards:
+                 logging.info("Step: Waiting for pack contents (0 cards found)...")
+                 time.sleep(0.2)
+                 self._send_command({"type": "ping"})
+                 new_state = self._read_packet(block_forever=True)
+            else:
+                break # Cards found, proceed to agent
+            
         # print(f"Blind target: {new_state.get('blind_target', 0)}")
         if not new_state:
             return self._crash_exit()

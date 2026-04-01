@@ -496,11 +496,26 @@ PACK OPENING
 function get_pack_cards()
     local cards = {}
     
-    if G.pack_cards and G.pack_cards.cards then
-        for i, card in ipairs(G.pack_cards.cards) do
+    -- [FIX] Check both possible UI locations for pack cards
+    -- Standard packs usually use G.pack_cards
+    local target_collection = nil
+    
+    if G.pack_cards and G.pack_cards.cards and #G.pack_cards.cards > 0 then
+        target_collection = G.pack_cards.cards
+    elseif G.booster_pack and G.booster_pack.cards and #G.booster_pack.cards > 0 then
+        -- Mega packs or other boosters might be here during animation
+        target_collection = G.booster_pack.cards
+    end
+
+    if target_collection then
+        for i, card in ipairs(target_collection) do
             table.insert(cards, {
+                -- [IMPROVED] PDF suggests getting more metadata for decision making
                 name = card.ability and card.ability.name or "Card",
+                type = card.ability and card.ability.set or "Unknown",
+                effect = card.ability and card.ability.effect or "None",
                 picked = card.picked or false,
+                is_centered = card.is_centered or false
             })
         end
     end

@@ -729,75 +729,37 @@ function Bot.execute(action)
     -- PACK ACTIONS
     elseif action.type == "pack_select" then
         local idx = action.index + 1
-        Bot.log("Selecting pack card at index " .. tostring(idx-1))
-
-        if not G.pack_cards then
-            Bot.log("ERROR: G.pack_cards is nil")
-            return
-        end
-        if not G.pack_cards.cards then
-            Bot.log("ERROR: G.pack_cards.cards is nil")
-            return
-        end
-        if not G.pack_cards.cards[idx] then
-            Bot.log("ERROR: No card at index " .. idx .. " (total cards: " .. #G.pack_cards.cards .. ")")
-            return
-        end
-
-        -- Check picks remaining (mega packs allow multiple selections)
-        local picks_remaining = G.pack_cards.config and G.pack_cards.config.choose or 1
-        if picks_remaining <= 0 then
-            Bot.log("ERROR: No picks remaining (already selected maximum cards for this pack)")
-            Bot.log("  You must skip the pack now or wait for it to auto-close")
-            return
-        end
-
-        local card = G.pack_cards.cards[idx]
-        local card_name = tostring(card.ability and card.ability.name or "unknown")
-        Bot.log("Selecting card: " .. card_name .. " (picks remaining: " .. picks_remaining .. ")")
-
-        local success, err = pcall(function()
-            G.FUNCS.use_card({config = {ref_table = card}})
-        end)
-
-        if not success then
-            Bot.log("ERROR selecting pack card: " .. tostring(err))
+        local area = Bot.get_pack_card_area()
+        
+        if area and area.cards and area.cards[idx] then
+            Bot.log("Clicking pack card " .. idx)
+            area.cards[idx]:click() -- Simulate direct click
         else
-            Bot.log("Successfully selected pack card")
+            Bot.log("FAILED to click pack card: Area or card not found")
         end
 
     elseif action.type == "pack_skip" then
-        -- CRITICAL: Check if booster_pack AND its cards exist before trying to skip
-        -- During cleanup or initialization, these might not exist yet
-        if not G.booster_pack or not G.booster_pack.cards then
-            -- Booster pack not ready yet or being destroyed, wait for it to load
-            -- Don't log spam - this is normal during pack loading
-            return
+        Bot.log("Attempting to skip pack via UI button...")
+        
+        -- Method 1: Try finding the button by its definition
+        local btn = nil
+        
+        -- Search specifically in the pack UI nodes
+        if G.booster_pack and G.booster_pack.UIBox then
+             btn = Bot.find_button_by_id(G.booster_pack.UIBox, 'skip_booster')
         end
-
-        -- Check if cards array is empty (all cards selected, pack auto-closing)
-        if #G.booster_pack.cards == 0 then
-            -- Pack is empty and closing, wait for state change
-            return
+        
+        -- If not found, search global buttons (backup)
+        if not btn and G.buttons then
+             btn = Bot.find_button_by_id(G.buttons, 'skip_booster')
         end
-
-        -- Prevent repeated skip attempts once we know pack is ready
-        if Bot.pack_skip_attempted then
-            return  -- Silently wait for state change
-        end
-        Bot.pack_skip_attempted = true
-
-        Bot.log("Skipping pack (state=" .. tostring(G.STATE) .. ")...")
-
-        -- Call skip_booster - works for all pack types including mega packs
-        local success, err = pcall(function()
-            G.FUNCS.skip_booster()
-        end)
-
-        if not success then
-            Bot.log("  ERROR skipping pack: " .. tostring(err))
+        
+        if btn then
+            Bot.log("Found Skip Button! Clicking...")
+            btn:click()
         else
-            Bot.log("  Successfully skipped pack")
+            Bot.log("Skip button not found in UI. Trying fallback function...")
+            G.FUNCS.skip_booster() -- Old method as last resort
         end
     end
 end
@@ -1117,40 +1079,42 @@ function Bot.can_skip_blind()
     return false
 end
 
+-- Helper to find the container holding the pack cards
+function Bot.get_pack_card_area()
+    -- 1. Standard location
+    if G.pack_cards and G.pack_cards.cards and #G.pack_cards.cards > 0 then
+        return G.pack_cards
+    end
+    -- 2. Booster location (common in Mega packs)
+    if G.booster_pack and G.booster_pack.cards and #G.booster_pack.cards > 0 then
+        return G.booster_pack
+    end
+    -- 3. Fallback: Search top-level UI for any area containing 'Booster' or 'Pack'
+    -- (This helps if a mod changed the variable name)
+    return nil 
+end
+
 function Bot.get_pack_cards()
     local cards = {}
-
-    -- For mega packs (state 999), G.pack_cards might not be populated immediately
-    -- or might be in a different location
-    if G.STATE == 999 then
-        -- Check multiple possible locations for mega pack cards
-        if G.booster_pack and G.booster_pack.cards then
-            for _, card in ipairs(G.booster_pack.cards) do
-                if card and card.ability then
-                    table.insert(cards, {name = card.ability.name})
-                end
-            end
-            return cards
-        end
-
-        -- Check if cards are in a UI element
-        if G.booster_pack_ui and G.booster_pack_ui.cards then
-            for _, card in ipairs(G.booster_pack_ui.cards) do
-                if card and card.ability then
-                    table.insert(cards, {name = card.ability.name})
-                end
-            end
-            return cards
+    local area = Bot.get_pack_card_area() -- Use the helper above
+    
+    if area and area.cards then
+        for i, card in ipairs(area.cards) do
+            table.insert(cards, {
+                name = card.ability and card.ability.name or "Card",
+                type = card.ability and card.ability.set or "Unknown",
+                effect = card.ability and card.ability.effect or "None",
+                picked = card.picked or false,
+                -- Send center coordinates to help debug visibility
+                x = card.T.x,
+                y = card.T.y
+            })
         end
     end
-
-    -- Standard pack handling
-    if G.pack_cards and G.pack_cards.cards then
-        for _, card in ipairs(G.pack_cards.cards) do
-            if card and card.ability then
-                table.insert(cards, {name = card.ability.name})
-            end
-        end
+    
+    -- Debug log if empty during pack phase
+    if #cards == 0 and G.STATE == 999 then
+        Bot.log("WARNING: In Pack Phase but found 0 cards. G.pack_cards=" .. tostring(G.pack_cards) .. " G.booster_pack=" .. tostring(G.booster_pack))
     end
 
     return cards
